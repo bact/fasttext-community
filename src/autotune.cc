@@ -261,10 +261,11 @@ void Autotune::abort() {
 void Autotune::startTimer(const Args& args) {
   std::chrono::steady_clock::time_point start =
       std::chrono::steady_clock::now();
-  timer_ = std::thread([=]() { timer(start, args.autotuneDuration); });
   bestScore_ = kUnknownBestScore;
   trials_ = 0;
+  // Set before starting the timer: it stops as soon as it reads false.
   continueTraining_ = true;
+  timer_ = std::thread([=]() { timer(start, args.autotuneDuration); });
 
   auto previousSignalHandler = std::signal(SIGINT, signalHandler);
   interruptSignalHandler = [&]() {
