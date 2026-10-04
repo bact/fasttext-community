@@ -15,6 +15,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <set>
 #include <tuple>
@@ -48,6 +49,10 @@ class FastText {
   bool quant_;
   int32_t version;
   std::unique_ptr<DenseMatrix> wordVectors_;
+  // Guards lazy fill of wordVectors_ (lazyComputeWordVectors) against
+  // concurrent callers. Plain mutex, not call_once: setMatrices() resets
+  // wordVectors_ and expects the next call to rebuild it.
+  std::mutex wordVectorsMutex_;
   std::exception_ptr trainException_;
 
   void signModel(std::ostream&);

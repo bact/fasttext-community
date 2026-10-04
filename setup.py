@@ -111,7 +111,9 @@ class BuildExt(build_ext):
     """A custom build extension for adding compiler-specific options."""
 
     c_opts = {
-        "msvc": ["/EHsc", "/O2"],
+        # _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR: VS 2022 17.10+ std::mutex
+        # crashes when an older msvcp140.dll is loaded at runtime.
+        "msvc": ["/EHsc", "/O2", "/D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR"],
         "unix": ["-O3", "-funroll-loops", "-pthread"],
     }
 
@@ -146,6 +148,7 @@ class BuildExt(build_ext):
         if ct == "unix":
             opts.append('-DVERSION_INFO="%s"' % self.distribution.get_version())
             opts.append(cpp_flag(self.compiler))
+            extra_link_args.append("-pthread")
             if has_flag(self.compiler, ["-fvisibility=hidden"]):
                 opts.append("-fvisibility=hidden")
         elif ct == "msvc":

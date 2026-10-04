@@ -17,6 +17,8 @@
 #include <vector.h>
 #include <cmath>
 #include <iterator>
+#include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 
@@ -27,6 +29,49 @@ typedef SSIZE_T ssize_t;
 
 using namespace pybind11::literals;
 namespace py = pybind11;
+
+// FastText + reader/writer lock, for concurrent use from Python threads.
+// - shared lock: read-only methods (predict, getNN, ...)
+// - exclusive lock: methods that replace state (train, loadModel,
+//   quantize, setMatrices)
+// pybind layer only: the CLI and WebAssembly builds are single-threaded.
+//
+// Rules:
+// 1. Lock via readLock()/writeLock(): they release the GIL while blocked.
+// 2. Under the lock, do C++ work only. Build Python objects after.
+// Why: on Python <= 3.11, allocating a Python object can run GC, i.e.
+// arbitrary Python code. That code may re-enter this non-recursive lock,
+// or hand the GIL to a thread that then blocks on the lock: deadlock.
+struct FastTextHandle
+{
+  fasttext::FastText ft;
+  std::shared_mutex mu;
+};
+
+// Waits on `mu` without the GIL. On free-threaded builds this also
+// detaches the thread, so a waiter can't stall a stop-the-world pause.
+// Caller must hold the GIL.
+template <typename Lock>
+Lock lockReleasingGil(std::shared_mutex &mu)
+{
+  Lock lock(mu, std::try_to_lock);
+  if (!lock.owns_lock())
+  {
+    py::gil_scoped_release release;
+    lock.lock();
+  }
+  return lock;
+}
+
+std::shared_lock<std::shared_mutex> readLock(FastTextHandle &w)
+{
+  return lockReleasingGil<std::shared_lock<std::shared_mutex>>(w.mu);
+}
+
+std::unique_lock<std::shared_mutex> writeLock(FastTextHandle &w)
+{
+  return lockReleasingGil<std::unique_lock<std::shared_mutex>>(w.mu);
+}
 
 py::str castToPythonString(const std::string &s, const char *onUnicodeError)
 {
@@ -67,16 +112,28 @@ std::vector<std::pair<fasttext::real, py::str>> castToPythonString(
   return transformedPredictions;
 }
 
-std::pair<std::vector<py::str>, std::vector<py::str>> getLineText(
-    fasttext::FastText &m,
-    const std::string text,
+std::vector<py::str> castToPythonString(
+    const std::vector<std::string> &strings,
     const char *onUnicodeError)
+{
+  std::vector<py::str> transformed;
+  for (const auto &s : strings)
+  {
+    transformed.push_back(castToPythonString(s, onUnicodeError));
+  }
+  return transformed;
+}
+
+// Split `text` into (words, labels). C++ only: safe under the model lock.
+std::pair<std::vector<std::string>, std::vector<std::string>> getLineTokens(
+    const fasttext::FastText &m,
+    const std::string &text)
 {
   std::shared_ptr<const fasttext::Dictionary> d = m.getDictionary();
   std::stringstream ioss(text);
   std::string token;
-  std::vector<py::str> words;
-  std::vector<py::str> labels;
+  std::vector<std::string> words;
+  std::vector<std::string> labels;
   while (d->readWord(ioss, token))
   {
     uint32_t h = d->hash(token);
@@ -85,22 +142,22 @@ std::pair<std::vector<py::str>, std::vector<py::str>> getLineText(
 
     if (type == fasttext::entry_type::word)
     {
-      words.push_back(castToPythonString(token, onUnicodeError));
+      words.push_back(token);
       // Labels must not be OOV!
     }
     else if (type == fasttext::entry_type::label && wid >= 0)
     {
-      labels.push_back(castToPythonString(token, onUnicodeError));
+      labels.push_back(token);
     }
     if (token == fasttext::Dictionary::EOS)
     {
       break;
     }
   }
-  return std::pair<std::vector<py::str>, std::vector<py::str>>(words, labels);
+  return {words, labels};
 }
 
-PYBIND11_MODULE(fasttext_pybind, m)
+PYBIND11_MODULE(fasttext_pybind, m, py::mod_gil_not_used())
 {
   py::class_<fasttext::Args>(m, "args")
       .def(py::init<>())
@@ -172,17 +229,19 @@ PYBIND11_MODULE(fasttext_pybind, m)
 
   m.def(
       "train",
-      [](fasttext::FastText &ft, fasttext::Args &a)
+      [](FastTextHandle &handle, fasttext::Args &a)
       {
+        // GIL already released by call_guard, so not writeLock().
+        std::unique_lock<std::shared_mutex> lock(handle.mu);
         if (a.hasAutotune())
         {
           fasttext::Autotune autotune(std::shared_ptr<fasttext::FastText>(
-              &ft, [](fasttext::FastText *) {}));
+              &handle.ft, [](fasttext::FastText *) {}));
           autotune.train(a);
         }
         else
         {
-          ft.train(a);
+          handle.ft.train(a);
         }
       },
       py::call_guard<py::gil_scoped_release>());
@@ -198,7 +257,7 @@ PYBIND11_MODULE(fasttext_pybind, m)
                         {m.size()},
                         {sizeof(fasttext::real)}); });
 
-  py::class_<fasttext::DenseMatrix>(
+  py::class_<fasttext::DenseMatrix, std::shared_ptr<fasttext::DenseMatrix>>(
       m, "DenseMatrix", py::buffer_protocol(), py::module_local())
       .def(py::init<>())
       .def(py::init<ssize_t, ssize_t>())
@@ -241,37 +300,40 @@ PYBIND11_MODULE(fasttext_pybind, m)
           (double (fasttext::Meter::*)(double) const) &
               fasttext::Meter::recallAtPrecision);
 
-  py::class_<fasttext::FastText>(m, "fasttext")
+  py::class_<FastTextHandle>(m, "fasttext")
       .def(py::init<>())
-      .def("getArgs", &fasttext::FastText::getArgs)
+      .def(
+          "getArgs",
+          [](FastTextHandle &w)
+          {
+            auto lock = readLock(w);
+            return w.ft.getArgs();
+          })
       .def(
           "getInputMatrix",
-          [](fasttext::FastText &m)
+          [](FastTextHandle &w)
           {
-            std::shared_ptr<const fasttext::DenseMatrix> mm =
-                m.getInputMatrix();
-            return mm.get();
-          },
-          pybind11::return_value_policy::reference)
+            auto lock = readLock(w);
+            return w.ft.getInputMatrix();
+          })
       .def(
           "getOutputMatrix",
-          [](fasttext::FastText &m)
+          [](FastTextHandle &w)
           {
-            std::shared_ptr<const fasttext::DenseMatrix> mm =
-                m.getOutputMatrix();
-            return mm.get();
-          },
-          pybind11::return_value_policy::reference)
+            auto lock = readLock(w);
+            return w.ft.getOutputMatrix();
+          })
       .def(
           "setMatrices",
-          [](fasttext::FastText &m,
+          [](FastTextHandle &w,
              py::buffer inputMatrixBuffer,
              py::buffer outputMatrixBuffer)
           {
             py::buffer_info inputMatrixInfo = inputMatrixBuffer.request();
             py::buffer_info outputMatrixInfo = outputMatrixBuffer.request();
 
-            m.setMatrices(
+            auto lock = writeLock(w);
+            w.ft.setMatrices(
                 std::make_shared<fasttext::DenseMatrix>(
                     inputMatrixInfo.shape[0],
                     inputMatrixInfo.shape[1],
@@ -283,15 +345,21 @@ PYBIND11_MODULE(fasttext_pybind, m)
           })
       .def(
           "loadModel",
-          [](fasttext::FastText &m, std::string s)
-          { m.loadModel(s); })
+          [](FastTextHandle &w, std::string s)
+          {
+            auto lock = writeLock(w);
+            w.ft.loadModel(s);
+          })
       .def(
           "saveModel",
-          [](fasttext::FastText &m, std::string s)
-          { m.saveModel(s); })
+          [](FastTextHandle &w, std::string s)
+          {
+            auto lock = readLock(w);
+            w.ft.saveModel(s);
+          })
       .def(
           "test",
-          [](fasttext::FastText &m,
+          [](FastTextHandle &w,
              const std::string &filename,
              int32_t k,
              fasttext::real threshold)
@@ -302,14 +370,15 @@ PYBIND11_MODULE(fasttext_pybind, m)
               throw std::invalid_argument("Test file cannot be opened!");
             }
             fasttext::Meter meter(false);
-            m.test(ifs, k, threshold, meter);
+            auto lock = readLock(w);
+            w.ft.test(ifs, k, threshold, meter);
             ifs.close();
             return std::tuple<int64_t, double, double>(
                 meter.nexamples(), meter.precision(), meter.recall());
           })
       .def(
           "getMeter",
-          [](fasttext::FastText &m, const std::string &filename, int32_t k)
+          [](FastTextHandle &w, const std::string &filename, int32_t k)
           {
             std::ifstream ifs(filename);
             if (!ifs.is_open())
@@ -317,26 +386,30 @@ PYBIND11_MODULE(fasttext_pybind, m)
               throw std::invalid_argument("Test file cannot be opened!");
             }
             fasttext::Meter meter(true);
-            m.test(ifs, k, 0.0, meter);
+            auto lock = readLock(w);
+            w.ft.test(ifs, k, 0.0, meter);
             ifs.close();
 
             return meter;
           })
       .def(
           "getSentenceVector",
-          [](fasttext::FastText &m,
+          [](FastTextHandle &w,
              fasttext::Vector &v,
              const std::string text)
           {
             std::stringstream ioss(text);
-            m.getSentenceVector(ioss, v);
+            auto lock = readLock(w);
+            w.ft.getSentenceVector(ioss, v);
           })
       .def(
           "tokenize",
-          [](fasttext::FastText &m, const std::string text)
+          [](FastTextHandle &w, const std::string text)
           {
+            auto lock = readLock(w);
             std::vector<std::string> text_split;
-            std::shared_ptr<const fasttext::Dictionary> d = m.getDictionary();
+            std::shared_ptr<const fasttext::Dictionary> d =
+                w.ft.getDictionary();
             std::stringstream ioss(text);
             std::string token;
             while (!ioss.eof())
@@ -348,21 +421,44 @@ PYBIND11_MODULE(fasttext_pybind, m)
             }
             return text_split;
           })
-      .def("getLine", &getLineText)
+      .def(
+          "getLine",
+          [](FastTextHandle &w,
+             const std::string text,
+             const char *onUnicodeError)
+          {
+            std::pair<std::vector<std::string>, std::vector<std::string>> tokens;
+            {
+              auto lock = readLock(w);
+              tokens = getLineTokens(w.ft, text);
+            }
+            return std::make_pair(
+                castToPythonString(tokens.first, onUnicodeError),
+                castToPythonString(tokens.second, onUnicodeError));
+          })
       .def(
           "multilineGetLine",
-          [](fasttext::FastText &m,
+          [](FastTextHandle &w,
              const std::vector<std::string> lines,
              const char *onUnicodeError)
           {
-            std::shared_ptr<const fasttext::Dictionary> d = m.getDictionary();
+            std::vector<
+                std::pair<std::vector<std::string>, std::vector<std::string>>>
+                all_tokens;
+            {
+              auto lock = readLock(w);
+              for (const auto &text : lines)
+              {
+                all_tokens.push_back(getLineTokens(w.ft, text));
+              }
+            }
             std::vector<std::vector<py::str>> all_words;
             std::vector<std::vector<py::str>> all_labels;
-            for (const auto &text : lines)
+            for (const auto &tokens : all_tokens)
             {
-              auto pair = getLineText(m, text, onUnicodeError);
-              all_words.push_back(pair.first);
-              all_labels.push_back(pair.second);
+              all_words.push_back(castToPythonString(tokens.first, onUnicodeError));
+              all_labels.push_back(
+                  castToPythonString(tokens.second, onUnicodeError));
             }
             return std::pair<
                 std::vector<std::vector<py::str>>,
@@ -370,40 +466,45 @@ PYBIND11_MODULE(fasttext_pybind, m)
           })
       .def(
           "getVocab",
-          [](fasttext::FastText &m, const char *onUnicodeError)
+          [](FastTextHandle &w, const char *onUnicodeError)
           {
-            py::str s;
-            std::vector<py::str> vocab_list;
+            std::vector<std::string> vocab;
             std::vector<int64_t> vocab_freq;
-            std::shared_ptr<const fasttext::Dictionary> d = m.getDictionary();
-            vocab_freq = d->getCounts(fasttext::entry_type::word);
-            for (size_t i = 0; i < vocab_freq.size(); i++)
             {
-              vocab_list.push_back(
-                  castToPythonString(d->getWord(i), onUnicodeError));
+              auto lock = readLock(w);
+              std::shared_ptr<const fasttext::Dictionary> d =
+                  w.ft.getDictionary();
+              vocab_freq = d->getCounts(fasttext::entry_type::word);
+              for (size_t i = 0; i < vocab_freq.size(); i++)
+              {
+                vocab.push_back(d->getWord(i));
+              }
             }
             return std::pair<std::vector<py::str>, std::vector<int64_t>>(
-                vocab_list, vocab_freq);
+                castToPythonString(vocab, onUnicodeError), vocab_freq);
           })
       .def(
           "getLabels",
-          [](fasttext::FastText &m, const char *onUnicodeError)
+          [](FastTextHandle &w, const char *onUnicodeError)
           {
-            std::vector<py::str> labels_list;
+            std::vector<std::string> labels;
             std::vector<int64_t> labels_freq;
-            std::shared_ptr<const fasttext::Dictionary> d = m.getDictionary();
-            labels_freq = d->getCounts(fasttext::entry_type::label);
-            for (size_t i = 0; i < labels_freq.size(); i++)
             {
-              labels_list.push_back(
-                  castToPythonString(d->getLabel(i), onUnicodeError));
+              auto lock = readLock(w);
+              std::shared_ptr<const fasttext::Dictionary> d =
+                  w.ft.getDictionary();
+              labels_freq = d->getCounts(fasttext::entry_type::label);
+              for (size_t i = 0; i < labels_freq.size(); i++)
+              {
+                labels.push_back(d->getLabel(i));
+              }
             }
             return std::pair<std::vector<py::str>, std::vector<int64_t>>(
-                labels_list, labels_freq);
+                castToPythonString(labels, onUnicodeError), labels_freq);
           })
       .def(
           "quantize",
-          [](fasttext::FastText &m,
+          [](FastTextHandle &w,
              const std::string input,
              bool qout,
              int32_t cutoff,
@@ -426,13 +527,14 @@ PYBIND11_MODULE(fasttext_pybind, m)
             qa.verbose = verbose;
             qa.dsub = dsub;
             qa.qnorm = qnorm;
-            m.quantize(qa);
+            auto lock = writeLock(w);
+            w.ft.quantize(qa);
           })
       .def(
           "predict",
           // NOTE: text needs to end in a newline
           // to exactly mimic the behavior of the cli
-          [](fasttext::FastText &m,
+          [](FastTextHandle &w,
              const std::string text,
              int32_t k,
              fasttext::real threshold,
@@ -440,28 +542,37 @@ PYBIND11_MODULE(fasttext_pybind, m)
           {
             std::stringstream ioss(text);
             std::vector<std::pair<fasttext::real, std::string>> predictions;
-            m.predictLine(ioss, predictions, k, threshold);
-
+            {
+              auto lock = readLock(w);
+              w.ft.predictLine(ioss, predictions, k, threshold);
+            }
             return castToPythonString(predictions, onUnicodeError);
           })
       .def(
           "multilinePredict",
           // NOTE: text needs to end in a newline
           // to exactly mimic the behavior of the cli
-          [](fasttext::FastText &m,
+          [](FastTextHandle &w,
              const std::vector<std::string> &lines,
              int32_t k,
              fasttext::real threshold,
              const char *onUnicodeError)
           {
+            std::vector<std::vector<std::pair<fasttext::real, std::string>>>
+                allPredictions(lines.size());
+            {
+              auto lock = readLock(w);
+              for (size_t i = 0; i < lines.size(); i++)
+              {
+                std::stringstream ioss(lines[i]);
+                w.ft.predictLine(ioss, allPredictions[i], k, threshold);
+              }
+            }
+
             std::vector<py::array_t<fasttext::real>> allProbabilities;
             std::vector<std::vector<py::str>> allLabels;
-            std::vector<std::pair<fasttext::real, std::string>> predictions;
-
-            for (const std::string &text : lines)
+            for (const auto &predictions : allPredictions)
             {
-              std::stringstream ioss(text);
-              m.predictLine(ioss, predictions, k, threshold);
               std::vector<fasttext::real> probabilities;
               std::vector<py::str> labels;
 
@@ -481,7 +592,7 @@ PYBIND11_MODULE(fasttext_pybind, m)
           })
       .def(
           "testLabel",
-          [](fasttext::FastText &m,
+          [](FastTextHandle &w,
              const std::string filename,
              int32_t k,
              fasttext::real threshold)
@@ -492,12 +603,21 @@ PYBIND11_MODULE(fasttext_pybind, m)
               throw std::invalid_argument("Test file cannot be opened!");
             }
             fasttext::Meter meter(false);
-            m.test(ifs, k, threshold, meter);
-            std::shared_ptr<const fasttext::Dictionary> d = m.getDictionary();
-            std::unordered_map<std::string, py::dict> returnedValue;
-            for (int32_t i = 0; i < d->nlabels(); i++)
+            std::vector<std::string> labels;
             {
-              returnedValue[d->getLabel(i)] = py::dict(
+              auto lock = readLock(w);
+              w.ft.test(ifs, k, threshold, meter);
+              std::shared_ptr<const fasttext::Dictionary> d =
+                  w.ft.getDictionary();
+              for (int32_t i = 0; i < d->nlabels(); i++)
+              {
+                labels.push_back(d->getLabel(i));
+              }
+            }
+            std::unordered_map<std::string, py::dict> returnedValue;
+            for (int32_t i = 0; i < static_cast<int32_t>(labels.size()); i++)
+            {
+              returnedValue[labels[i]] = py::dict(
                   "precision"_a = meter.precision(i),
                   "recall"_a = meter.recall(i),
                   "f1score"_a = meter.f1Score(i));
@@ -507,76 +627,93 @@ PYBIND11_MODULE(fasttext_pybind, m)
           })
       .def(
           "getWordId",
-          [](fasttext::FastText &m, const std::string &word)
+          [](FastTextHandle &w, const std::string &word)
           {
-            return m.getWordId(word);
+            auto lock = readLock(w);
+            return w.ft.getWordId(word);
           })
       .def(
           "getSubwordId",
-          [](fasttext::FastText &m, const std::string word)
+          [](FastTextHandle &w, const std::string word)
           {
-            return m.getSubwordId(word);
+            auto lock = readLock(w);
+            return w.ft.getSubwordId(word);
           })
       .def(
           "getLabelId",
-          [](fasttext::FastText &m, const std::string &label)
+          [](FastTextHandle &w, const std::string &label)
           {
-            return m.getLabelId(label);
+            auto lock = readLock(w);
+            return w.ft.getLabelId(label);
           })
       .def(
           "getInputVector",
-          [](fasttext::FastText &m, fasttext::Vector &vec, int32_t ind)
+          [](FastTextHandle &w, fasttext::Vector &vec, int32_t ind)
           {
-            m.getInputVector(vec, ind);
+            auto lock = readLock(w);
+            w.ft.getInputVector(vec, ind);
           })
       .def(
           "getWordVector",
-          [](fasttext::FastText &m,
+          [](FastTextHandle &w,
              fasttext::Vector &vec,
              const std::string word)
-          { m.getWordVector(vec, word); })
+          {
+            auto lock = readLock(w);
+            w.ft.getWordVector(vec, word);
+          })
       .def(
           "getNN",
-          [](fasttext::FastText &m,
+          [](FastTextHandle &w,
              const std::string &word,
              int32_t k,
              const char *onUnicodeError)
           {
-            return castToPythonString(m.getNN(word, k), onUnicodeError);
+            std::vector<std::pair<fasttext::real, std::string>> nn;
+            {
+              auto lock = readLock(w);
+              nn = w.ft.getNN(word, k);
+            }
+            return castToPythonString(nn, onUnicodeError);
           })
       .def(
           "getAnalogies",
-          [](fasttext::FastText &m,
+          [](FastTextHandle &w,
              const std::string &wordA,
              const std::string &wordB,
              const std::string &wordC,
              int32_t k,
              const char *onUnicodeError)
           {
-            return castToPythonString(
-                m.getAnalogies(k, wordA, wordB, wordC), onUnicodeError);
+            std::vector<std::pair<fasttext::real, std::string>> analogies;
+            {
+              auto lock = readLock(w);
+              analogies = w.ft.getAnalogies(k, wordA, wordB, wordC);
+            }
+            return castToPythonString(analogies, onUnicodeError);
           })
       .def(
           "getSubwords",
-          [](fasttext::FastText &m,
+          [](FastTextHandle &w,
              const std::string word,
              const char *onUnicodeError)
           {
             std::vector<std::string> subwords;
             std::vector<int32_t> ngrams;
-            std::shared_ptr<const fasttext::Dictionary> d = m.getDictionary();
-            d->getSubwords(word, ngrams, subwords);
-            std::vector<py::str> transformedSubwords;
-
-            for (const auto &subword : subwords)
             {
-              transformedSubwords.push_back(
-                  castToPythonString(subword, onUnicodeError));
+              auto lock = readLock(w);
+              std::shared_ptr<const fasttext::Dictionary> d =
+                  w.ft.getDictionary();
+              d->getSubwords(word, ngrams, subwords);
             }
-
             return std::pair<std::vector<py::str>, std::vector<int32_t>>(
-                transformedSubwords, ngrams);
+                castToPythonString(subwords, onUnicodeError), ngrams);
           })
-      .def("isQuant", [](fasttext::FastText &m)
-           { return m.isQuant(); });
+      .def(
+          "isQuant",
+          [](FastTextHandle &w)
+          {
+            auto lock = readLock(w);
+            return w.ft.isQuant();
+          });
 }

@@ -661,6 +661,7 @@ namespace fasttext
 
   void FastText::lazyComputeWordVectors()
   {
+    std::lock_guard<std::mutex> lock(wordVectorsMutex_);
     if (!wordVectors_)
     {
       wordVectors_ = std::unique_ptr<DenseMatrix>(
